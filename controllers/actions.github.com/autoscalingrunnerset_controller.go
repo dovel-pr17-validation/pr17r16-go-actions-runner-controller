@@ -1,0 +1,1714 @@
+/*
+Copyright 2020 The actions-runner-controller authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package actionsgithubcom
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"maps"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/actions/actions-runner-controller/apis/actions.github.com/v1alpha1"
+	"github.com/actions/actions-runner-controller/build"
+	"github.com/actions/actions-runner-controller/controllers/actions.github.com/secretresolver"
+	"github.com/actions/scaleset"
+	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+)
+
+const (
+	autoscalingRunnerSetFinalizerName = "autoscalingrunnerset.actions.github.com/finalizer"
+	runnerScaleSetIDAnnotationKey     = "runner-scale-set-id"
+)
+
+// AutoscalingRunnerSetReconciler reconciles a AutoscalingRunnerSet object
+type AutoscalingRunnerSetReconciler struct {
+	client.Client
+	Log                                           logr.Logger
+	Scheme                                        *runtime.Scheme
+	ControllerNamespace                           string
+	DefaultRunnerScaleSetListenerImage            string
+	DefaultRunnerScaleSetListenerImagePullSecrets []string
+	ResourceBuilder
+}
+
+// +kubebuilder:rbac:groups=actions.github.com,resources=autoscalingrunnersets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=actions.github.com,resources=autoscalingrunnersets/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=actions.github.com,resources=autoscalingrunnersets/finalizers,verbs=update
+// +kubebuilder:rbac:groups=actions.github.com,resources=ephemeralrunnersets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=actions.github.com,resources=ephemeralrunnersets/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=actions.github.com,resources=autoscalinglisteners,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=actions.github.com,resources=autoscalinglisteners/status,verbs=get;update;patch
+
+// Reconcile a AutoscalingRunnerSet resource to meet its desired spec.
+func (r *AutoscalingRunnerSetReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, err error) {
+	log := r.Log.WithValues("autoscalingrunnerset", req.NamespacedName)
+	defer func() {
+		result, err = requeueOnRateLimit(ctx, result, err, log)
+	}()
+
+	var autoscalingRunnerSet v1alpha1.AutoscalingRunnerSet
+	if err := r.Get(ctx, req.NamespacedName, &autoscalingRunnerSet); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	runnerSet := newLazyCopy(&autoscalingRunnerSet)
+
+	if !autoscalingRunnerSet.DeletionTimestamp.IsZero() {
+		if !controllerutil.ContainsFinalizer(&autoscalingRunnerSet, autoscalingRunnerSetFinalizerName) {
+			return ctrl.Result{}, nil
+		}
+
+		log.Info("Deleting resources")
+		done, err := r.cleanUpResources(ctx, &autoscalingRunnerSet, log)
+		if err != nil {
+			log.Error(err, "Failed to clean up resources during deletion")
+			return ctrl.Result{}, err
+		}
+		if !done {
+			log.Info("Waiting for resources to be cleaned up before removing finalizer")
+			return ctrl.Result{
+				RequeueAfter: 5 * time.Second,
+			}, nil
+		}
+
+		if err := r.removeFinalizersFromDependentResources(ctx, &autoscalingRunnerSet, log); err != nil {
+			log.Error(err, "Failed to remove finalizers on dependent resources")
+			return ctrl.Result{}, err
+		}
+
+		if controllerutil.RemoveFinalizer(runnerSet.Mutate(), autoscalingRunnerSetFinalizerName) {
+			log.Info("Removing finalizer")
+			if err := r.Patch(ctx, &autoscalingRunnerSet, runnerSet.MergeFrom()); err != nil && !kerrors.IsNotFound(err) {
+				log.Error(err, "Failed to update autoscaling runner set without finalizer")
+				return ctrl.Result{}, err
+			}
+		}
+
+		log.Info("Successfully removed finalizer after cleanup")
+		r.ResourceCache.Delete(&autoscalingRunnerSet)
+		return ctrl.Result{}, nil
+	}
+
+	if !v1alpha1.IsVersionAllowed(autoscalingRunnerSet.Labels[LabelKeyKubernetesVersion], build.Version) {
+		if err := r.Delete(ctx, &autoscalingRunnerSet); err != nil {
+			log.Error(
+				err, "Failed to delete autoscaling runner set on version mismatch",
+				"buildVersion", build.Version,
+				"autoscalingRunnerSetVersion", autoscalingRunnerSet.Labels[LabelKeyKubernetesVersion],
+			)
+			return ctrl.Result{}, nil
+		}
+
+		log.Info(
+			"Autoscaling runner set version doesn't match the build version. Deleting the resource.",
+			"buildVersion", build.Version,
+			"autoscalingRunnerSetVersion", autoscalingRunnerSet.Labels[LabelKeyKubernetesVersion],
+		)
+		return ctrl.Result{}, nil
+	}
+
+	if !controllerutil.ContainsFinalizer(&autoscalingRunnerSet, autoscalingRunnerSetFinalizerName) {
+		controllerutil.AddFinalizer(runnerSet.Mutate(), autoscalingRunnerSetFinalizerName)
+		log.Info("Adding finalizer")
+
+		if err := r.Patch(ctx, &autoscalingRunnerSet, runnerSet.MergeFrom()); err != nil {
+			log.Error(err, "Failed to update autoscaling runner set with finalizer")
+			return ctrl.Result{}, err
+		}
+
+		log.Info("Successfully added finalizer")
+		return ctrl.Result{}, nil
+	}
+
+	// The outdated phase is sticky. It means the runners rejected the runner
+	// spec they were given, so the only edit worth retrying is one that changes
+	// what the next runner would be handed: the runner spec, or the metadata
+	// stamped onto it. Every other edit - replica bounds, runner group, scale
+	// set name - bumps metadata.generation without changing anything the runners
+	// objected to, and acting on it would switch the listener back on to acquire
+	// jobs for runners that will reject the spec exactly as before.
+	//
+	// This is therefore checked before the generation comparison below, which
+	// would otherwise move the phase to pending for any spec edit at all and
+	// undo the teardown.
+	if autoscalingRunnerSet.Status.Phase == v1alpha1.AutoscalingRunnerSetPhaseOutdated {
+		corrected, err := r.outdatedRunnerSpecCorrected(ctx, &autoscalingRunnerSet, log)
+		if err != nil {
+			log.Error(err, "Failed to compare the outdated runner spec with the desired one")
+			return ctrl.Result{}, err
+		}
+
+		if !corrected {
+			return r.reconcileOutdated(ctx, &autoscalingRunnerSet, log)
+		}
+
+		// The runner spec changed, so the scale set may run again. Move to
+		// pending and let the reconcile below publish the new spec: that patch
+		// also advances the actionable revision, which is what tells the
+		// EphemeralRunnerSet to stop judging itself by the runners that failed.
+		log.Info("Runner spec of an outdated autoscaling runner set changed. Recovering from the outdated phase")
+		if err := r.updateStatus(
+			ctx,
+			&autoscalingRunnerSet,
+			v1alpha1.AutoscalingRunnerSetPhasePending,
+			autoscalingRunnerSet.Status.ObservedGeneration,
+			log,
+		); err != nil {
+			log.Error(err, "Failed to update autoscaling runner set status with pending phase")
+			return ctrl.Result{}, err
+		}
+	}
+
+	// The spec changed since we last observed it, so move back to the pending
+	// phase. The observed generation is deliberately left at its old value here:
+	// it only catches up at the end of a successful reconcile, so a reconcile
+	// that fails half way through is retried as pending rather than being
+	// mistaken for settled.
+	if autoscalingRunnerSet.Generation > autoscalingRunnerSet.Status.ObservedGeneration {
+		if err := r.updateStatus(
+			ctx,
+			&autoscalingRunnerSet,
+			v1alpha1.AutoscalingRunnerSetPhasePending,
+			autoscalingRunnerSet.Status.ObservedGeneration,
+			log,
+		); err != nil {
+			log.Error(err, "Failed to update autoscaling runner set status with pending phase")
+			return ctrl.Result{}, err
+		}
+	}
+
+	if shouldCreateScaleSet(&autoscalingRunnerSet) {
+		log.Info("Creating runner scale set")
+		return r.createRunnerScaleSet(ctx, &autoscalingRunnerSet, log)
+	}
+
+	// Make sure the runner group of the scale set is up to date
+	currentRunnerGroupName, ok := autoscalingRunnerSet.Annotations[AnnotationKeyGitHubRunnerGroupName]
+	if !ok || (len(autoscalingRunnerSet.Spec.RunnerGroup) > 0 && !strings.EqualFold(currentRunnerGroupName, autoscalingRunnerSet.Spec.RunnerGroup)) {
+		log.Info("AutoScalingRunnerSet runner group changed. Updating the runner scale set.")
+		return r.updateRunnerScaleSetRunnerGroup(ctx, &autoscalingRunnerSet, log)
+	}
+
+	// Make sure the runner scale set name is up to date
+	currentRunnerScaleSetName, ok := autoscalingRunnerSet.Annotations[AnnotationKeyGitHubRunnerScaleSetName]
+	if !ok || (len(autoscalingRunnerSet.Spec.RunnerScaleSetName) > 0 && !strings.EqualFold(currentRunnerScaleSetName, autoscalingRunnerSet.Spec.RunnerScaleSetName)) {
+		log.Info("AutoScalingRunnerSet runner scale set name changed. Updating the runner scale set.")
+		return r.updateRunnerScaleSetName(ctx, &autoscalingRunnerSet, log)
+	}
+
+	var ephemeralRunnerSet v1alpha1.EphemeralRunnerSet
+	err = r.Get(
+		ctx,
+		types.NamespacedName{
+			Namespace: autoscalingRunnerSet.Namespace,
+			Name:      autoscalingRunnerSet.Name,
+		},
+		&ephemeralRunnerSet,
+	)
+	switch {
+	case kerrors.IsNotFound(err):
+		log.Info("Creating ephemeral runner set")
+		return r.createEphemeralRunnerSet(ctx, &autoscalingRunnerSet, log)
+	case err != nil:
+		log.Error(err, "Failed to get ephemeral runner")
+		return ctrl.Result{}, err
+	case ephemeralRunnerSetOutdatedForAppliedRevision(&ephemeralRunnerSet) &&
+		!r.runnerSpecChanged(&autoscalingRunnerSet, &ephemeralRunnerSet, log):
+		// The runners rejected the spec they were given, so the scale set has to
+		// stop acquiring jobs it cannot run. Record that in the phase first: it is
+		// what keeps the listener switched off across reconciles, and what stops
+		// the branches below from rebuilding it. This also covers Pending during a
+		// metadata-only listener rebuild, which leaves the runner spec untouched
+		// and so is not a recovery signal. The observed generation is carried over
+		// unchanged, so a spec update still registers as new work.
+		log.Info("Ephemeral runner set is outdated. Moving the autoscaling runner set to the outdated phase")
+		if err := r.updateStatus(
+			ctx,
+			&autoscalingRunnerSet,
+			v1alpha1.AutoscalingRunnerSetPhaseOutdated,
+			autoscalingRunnerSet.Status.ObservedGeneration,
+			log,
+		); err != nil {
+			log.Error(err, "Failed to update autoscaling runner set status with outdated phase")
+			return ctrl.Result{}, err
+		}
+
+		return r.reconcileOutdated(ctx, &autoscalingRunnerSet, log)
+
+	default:
+		desired, err := r.newEphemeralRunnerSet(&autoscalingRunnerSet)
+		if err != nil {
+			log.Error(err, "Failed to generate ephemeral runner set spec")
+			return ctrl.Result{}, nil
+		}
+
+		// Recovering from the outdated phase has to advance the revision even
+		// when only the runner metadata changed. The revision is what tells the
+		// EphemeralRunnerSet to stop judging itself by the runners that failed,
+		// clearing its outdated phase and allowing it to scale up again; without
+		// it the metadata patch below would land and the set would be pushed
+		// straight back to outdated.
+		recoveringFromOutdated := ephemeralRunnerSetOutdatedForAppliedRevision(&ephemeralRunnerSet) &&
+			ephemeralRunnerSetDesiredSpecChanged(&ephemeralRunnerSet, desired)
+		if ephemeralRunnerSetActionableSpecChanged(&ephemeralRunnerSet, desired) || recoveringFromOutdated {
+			original := ephemeralRunnerSet.DeepCopy()
+			ephemeralRunnerSet.Spec.EphemeralRunnerMetadata = desired.Spec.EphemeralRunnerMetadata
+			ephemeralRunnerSet.Spec.EphemeralRunnerSpec = desired.Spec.EphemeralRunnerSpec
+			ephemeralRunnerSet.Spec.ActionableRevision = nextActionableRevision(&ephemeralRunnerSet)
+			ephemeralRunnerSet.Labels = r.filterAndMergeLabels(ephemeralRunnerSet.Labels, desired.Labels)
+			ephemeralRunnerSet.Annotations = r.mergeAnnotations(ephemeralRunnerSet.Annotations, desired.Annotations)
+
+			log.Info("Updating ephemeral runner set spec to match the desired spec")
+			if err := r.Patch(ctx, &ephemeralRunnerSet, client.MergeFrom(original)); err != nil {
+				log.Error(err, "Failed to patch ephemeral runner set to match the desired spec")
+				return ctrl.Result{}, err
+			}
+
+			log.Info("Successfully patched ephemeral runner set spec")
+			return ctrl.Result{}, nil
+		}
+
+		// Merge rather than overwrite so annotations/labels applied by other
+		// controllers or users are preserved. Compare against the merge result so
+		// foreign keys do not make this permanently report "modified".
+		desiredLabels := r.filterAndMergeLabels(ephemeralRunnerSet.Labels, desired.Labels)
+		desiredAnnotations := r.mergeAnnotations(ephemeralRunnerSet.Annotations, desired.Annotations)
+
+		ephemeralRunnerMetadataModified := !apiequality.Semantic.DeepEqual(ephemeralRunnerSet.Spec.EphemeralRunnerMetadata, desired.Spec.EphemeralRunnerMetadata)
+		ephemeralRunnerLabelsModified := !maps.Equal(ephemeralRunnerSet.Labels, desiredLabels)
+		ephemeralRunnerAnnotationsModified := !maps.Equal(ephemeralRunnerSet.Annotations, desiredAnnotations)
+
+		if ephemeralRunnerLabelsModified || ephemeralRunnerAnnotationsModified || ephemeralRunnerMetadataModified {
+			original := ephemeralRunnerSet.DeepCopy()
+			ephemeralRunnerSet.Labels = desiredLabels
+			ephemeralRunnerSet.Annotations = desiredAnnotations
+			ephemeralRunnerSet.Spec.EphemeralRunnerMetadata = desired.Spec.EphemeralRunnerMetadata
+			log.Info("Updating ephemeral runner set metadata to match desired labels and annotations")
+			if err := r.Patch(ctx, &ephemeralRunnerSet, client.MergeFrom(original)); err != nil {
+				log.Error(err, "Failed to patch ephemeral runner set metadata to match desired labels and annotations")
+				return ctrl.Result{}, err
+			}
+
+			log.Info("Successfully patched ephemeral runner set metadata")
+			return ctrl.Result{}, nil
+		}
+	}
+
+	// Renamed listeners are dropped before the lookup below, which is by the
+	// current name and so cannot see them. Leaving one in place would let the
+	// scale set run two listeners at once: the replacement created here, and the
+	// one still holding a pod under the name the scale set used to derive.
+	switch deleted, err := r.deleteRenamedListeners(ctx, &autoscalingRunnerSet, log); {
+	case err != nil:
+		log.Error(err, "Failed to delete the listeners left behind under a previous name")
+		return ctrl.Result{}, err
+	case deleted:
+		return ctrl.Result{}, nil
+	}
+
+	var listener v1alpha1.AutoscalingListener
+	err = r.Get(
+		ctx,
+		types.NamespacedName{
+			Namespace: r.ControllerNamespace,
+			Name:      scaleSetListenerName(&autoscalingRunnerSet),
+		},
+		&listener,
+	)
+	switch {
+	case kerrors.IsNotFound(err):
+		gone, err := r.runnerScaleSetGone(ctx, &autoscalingRunnerSet)
+		if err != nil {
+			log.Error(err, "Failed to confirm the runner scale set exists before creating the listener")
+			return ctrl.Result{}, err
+		}
+		if gone {
+			log.Info("Recorded runner scale set no longer exists on the Actions service. Registering it again before creating the listener")
+			return r.createRunnerScaleSet(ctx, &autoscalingRunnerSet, log)
+		}
+
+		log.Info("AutoscalingListener does not exist, creating autoscaling listener")
+		return r.createAutoScalingListenerForRunnerSet(ctx, &autoscalingRunnerSet, &ephemeralRunnerSet, log)
+	case err != nil:
+		log.Error(err, "Failed to get AutoscalingListener resource")
+		return ctrl.Result{}, err
+	default:
+		desired, err := r.newAutoscalingListener(
+			&autoscalingRunnerSet,
+			&ephemeralRunnerSet,
+			r.ControllerNamespace,
+			r.DefaultRunnerScaleSetListenerImage,
+			r.listenerImagePullSecrets(),
+		)
+		if err != nil {
+			log.Error(err, "Failed to generate AutoscalingListener spec")
+			return ctrl.Result{}, nil
+		}
+
+		// The drift check has to come before the phase is started again. While a
+		// scale set is parked, reconcileOutdated returns early and no listener
+		// spec drift is propagated, yet edits outside the runner spec are still
+		// allowed in that window. Starting first would rebuild the pod and its
+		// children from the spec the listener was parked with, and let it
+		// acquire jobs under it until the next reconcile noticed. Deleting
+		// instead re-creates the listener with the phase unset, which means
+		// running, so it comes back correct in one step.
+		if listenerSpecChanged(&listener, desired) ||
+			!maps.Equal(listener.Labels, desired.Labels) ||
+			!maps.Equal(listener.Annotations, desired.Annotations) {
+			// The listener is about to be torn down and rebuilt, which is what
+			// the pending phase means. Report it here rather than relying on the
+			// generation check above: the desired listener is derived from the
+			// AutoscalingRunnerSet's labels and annotations as well as its spec,
+			// and metadata writes do not bump metadata.generation. Without this,
+			// a label-only edit would leave the scale set claiming to be running
+			// while it has no listener at all, and it would keep claiming that
+			// if the rebuild never succeeded.
+			if err := r.updateStatus(
+				ctx,
+				&autoscalingRunnerSet,
+				v1alpha1.AutoscalingRunnerSetPhasePending,
+				autoscalingRunnerSet.Status.ObservedGeneration,
+				log,
+			); err != nil {
+				log.Error(err, "Failed to update autoscaling runner set status before re-creating the listener")
+				return ctrl.Result{}, err
+			}
+
+			log.Info("Deleting AutoscalingListener to re-create with updated spec")
+			if err := r.Delete(ctx, &listener); err != nil {
+				log.Error(err, "Failed to delete AutoscalingListener for re-creation")
+				return ctrl.Result{}, err
+			}
+			log.Info("Deleted AutoscalingListener, will re-create on next reconcile")
+			return ctrl.Result{}, nil
+		}
+
+		// The spec already matches, so a listener that was switched off may run
+		// again as it stands. Start it by moving the phase rather than by
+		// replacing the object: the listener controller rebuilds the pod and the
+		// rest of the child resources from it.
+		if listener.Spec.Phase.Stopped() {
+			log.Info("Starting the stopped listener")
+			original := listener.DeepCopy()
+			listener.Spec.Phase = v1alpha1.AutoscalingListenerPhaseRunning
+			if err := r.Patch(ctx, &listener, client.MergeFrom(original)); err != nil {
+				log.Error(err, "Failed to start the stopped listener")
+				return ctrl.Result{}, err
+			}
+
+			log.Info("Started the stopped listener")
+			return ctrl.Result{}, nil
+		}
+	}
+
+	log.Info("Autoscaling runner set is up to date and ready")
+	if err := r.updateStatus(
+		ctx,
+		&autoscalingRunnerSet,
+		v1alpha1.AutoscalingRunnerSetPhaseRunning,
+		autoscalingRunnerSet.Generation,
+		log,
+	); err != nil {
+		log.Error(err, "Failed to update autoscaling runner set status to running")
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{}, nil
+}
+
+// outdatedRunnerSpecCorrected reports whether the runner spec that the runners
+// rejected has since been changed, which is the only thing that takes a scale
+// set out of the outdated phase.
+//
+// Keying recovery on metadata.generation instead would recover on any spec edit
+// at all, including ones that leave the runner spec untouched, and hand the
+// listener back to a scale set whose runners will reject the very same spec
+// again.
+//
+// A missing EphemeralRunnerSet counts as corrected. There is nothing left to
+// compare against, and the set is only absent because something outside the
+// controller removed it, so the reconcile is allowed to rebuild it from the
+// current spec rather than sitting in a phase it could never leave.
+func (r *AutoscalingRunnerSetReconciler) outdatedRunnerSpecCorrected(ctx context.Context, autoscalingRunnerSet *v1alpha1.AutoscalingRunnerSet, log logr.Logger) (bool, error) {
+	var ephemeralRunnerSet v1alpha1.EphemeralRunnerSet
+	err := r.Get(
+		ctx,
+		types.NamespacedName{
+			Namespace: autoscalingRunnerSet.Namespace,
+			Name:      autoscalingRunnerSet.Name,
+		},
+		&ephemeralRunnerSet,
+	)
+	switch {
+	case kerrors.IsNotFound(err):
+		return true, nil
+	case err != nil:
+		return false, err
+	}
+
+	return r.runnerSpecChanged(autoscalingRunnerSet, &ephemeralRunnerSet, log), nil
+}
+
+// runnerSpecChanged compares the part of the EphemeralRunnerSet spec the
+// AutoscalingRunnerSet owns - the runner spec and the metadata stamped onto the
+// runners - with what the set is currently running.
+//
+// A spec that cannot be built counts as unchanged. The comparison is used to
+// decide whether a rejected runner spec may be retried, and an unusable desired
+// spec is no evidence that it was corrected.
+func (r *AutoscalingRunnerSetReconciler) runnerSpecChanged(autoscalingRunnerSet *v1alpha1.AutoscalingRunnerSet, ephemeralRunnerSet *v1alpha1.EphemeralRunnerSet, log logr.Logger) bool {
+	desired, err := r.newEphemeralRunnerSet(autoscalingRunnerSet)
+	if err != nil {
+		log.Error(err, "Failed to generate ephemeral runner set spec to compare against the rejected runner spec")
+		return false
+	}
+
+	return ephemeralRunnerSetDesiredSpecChanged(ephemeralRunnerSet, desired)
+}
+
+// listenerSpecChanged reports whether the live listener spec differs from the
+// desired one in a way that requires replacing the listener.
+//
+// Phase is excluded. It is the one field the AutoscalingRunnerSet controller
+// writes onto a live listener rather than deriving from its own spec, so
+// comparing it would make a stopped listener look like drift and delete the very
+// object the stop is meant to preserve. Starting and stopping is handled by
+// patching the phase instead.
+//
+// Semantic equality treats nil and empty collections alike: omitempty drops
+// explicit empty input when the derived listener is persisted. Comparing those
+// representations strictly would replace an unchanged listener on every reconcile.
+func listenerSpecChanged(current, desired *v1alpha1.AutoscalingListener) bool {
+	if current == nil || desired == nil {
+		return current != desired
+	}
+
+	currentSpec := current.Spec
+	desiredSpec := desired.Spec
+	currentSpec.Phase = ""
+	desiredSpec.Phase = ""
+
+	return !apiequality.Semantic.DeepEqual(currentSpec, desiredSpec)
+}
+
+// stopListener switches the listener off without deleting it.
+//
+// The child resources go either way: the listener controller tears down the pod,
+// the config secret and the RBAC once the phase is Stopped, exactly as deleting
+// the listener would have. What survives is the AutoscalingListener object
+// itself, with its spec and finalizer, so a parked scale set stays visible as
+// Phase: Stopped rather than as a listener that silently does not exist, and the
+// custom resource is not churned every time a scale set is parked and recovered.
+// Listeners are found by their back-reference to the scale set rather than by
+// the name derived from it. The derived name is a hash over the runner group and
+// the config URL, so editing either renames the listener the controller looks
+// for - and a parked scale set accepts exactly those edits. Looking the listener
+// up by name would miss the one still running under the previous name and leave
+// it acquiring jobs for a scale set that is supposed to be switched off.
+func (r *AutoscalingRunnerSetReconciler) stopListener(ctx context.Context, autoscalingRunnerSet *v1alpha1.AutoscalingRunnerSet, log logr.Logger) error {
+	listeners, err := r.listenersForAutoscalingRunnerSet(ctx, autoscalingRunnerSet)
+	if err != nil {
+		return err
+	}
+
+	// Nothing to switch off. A scale set that is switched off never creates a
+	// listener, so this is the normal state after a restart.
+	for i := range listeners {
+		listener := &listeners[i]
+		if !listener.DeletionTimestamp.IsZero() || listener.Spec.Phase.Stopped() {
+			continue
+		}
+
+		log.Info("Stopping the listener so no further jobs are acquired", "listener", listener.Name)
+		original := listener.DeepCopy()
+		listener.Spec.Phase = v1alpha1.AutoscalingListenerPhaseStopped
+		if err := r.Patch(ctx, listener, client.MergeFrom(original)); err != nil {
+			return err
+		}
+
+		log.Info("Stopped the listener", "listener", listener.Name)
+	}
+
+	return nil
+}
+
+// listenersForAutoscalingRunnerSet returns every listener that names this scale
+// set as its own, which is the same back-reference the controller's watch uses
+// to map a listener back to the set that owns it.
+func (r *AutoscalingRunnerSetReconciler) listenersForAutoscalingRunnerSet(
+	ctx context.Context,
+	autoscalingRunnerSet *v1alpha1.AutoscalingRunnerSet,
+) ([]v1alpha1.AutoscalingListener, error) {
+	var list v1alpha1.AutoscalingListenerList
+	if err := r.List(
+		ctx,
+		&list,
+		client.InNamespace(r.ControllerNamespace),
+		client.MatchingFields{
+			autoscalingRunnerSetOwnerKey: autoscalingRunnerSetOwnerIndexValue(
+				autoscalingRunnerSet.Namespace,
+				autoscalingRunnerSet.Name,
+			),
+		},
+	); err != nil {
+		return nil, fmt.Errorf("failed to list listeners: %w", err)
+	}
+
+	return list.Items, nil
+}
+
+// deleteRenamedListeners removes the listeners a scale set owns that no longer
+// answer to the name derived from it.
+//
+// That name is a hash over the runner group and the config URL, so editing
+// either renames the listener the rest of the lifecycle looks for, and the
+// listener created under the previous name becomes unreachable: nothing gets,
+// updates or deletes it again while the scale set lives. It is not inert,
+// though - it keeps its pod, and so keeps acquiring jobs alongside whatever
+// replaces it. Deleting it here is what makes a rename a replacement rather than
+// an addition.
+func (r *AutoscalingRunnerSetReconciler) deleteRenamedListeners(
+	ctx context.Context,
+	autoscalingRunnerSet *v1alpha1.AutoscalingRunnerSet,
+	log logr.Logger,
+) (deleted bool, err error) {
+	listeners, err := r.listenersForAutoscalingRunnerSet(ctx, autoscalingRunnerSet)
+	if err != nil {
+		return false, err
+	}
+
+	currentName := scaleSetListenerName(autoscalingRunnerSet)
+	for i := range listeners {
+		listener := &listeners[i]
+		if listener.Name == currentName {
+			continue
+		}
+
+		deleted = true
+		if !listener.DeletionTimestamp.IsZero() {
+			continue
+		}
+
+		log.Info("Deleting a listener left behind under a previous name", "listener", listener.Name)
+		if err := r.Delete(ctx, listener); err != nil && !kerrors.IsNotFound(err) {
+			return true, fmt.Errorf("failed to delete renamed listener %q: %w", listener.Name, err)
+		}
+	}
+
+	return deleted, nil
+}
+
+// propagateToStoppedListener brings a switched-off listener's spec up to date.
+//
+// Switched off is not the same as frozen. A parked scale set still accepts edits
+// that are not a recovery signal - replica bounds, labels, annotations - and
+// those belong to the listener even though it is not running. Landing them now
+// means the listener that eventually starts is built from the spec as it stands
+// then, rather than from the spec it was parked with.
+//
+// The spec is patched in place rather than being replaced the way drift is
+// handled on the running path. Replacing exists to rebuild the pod; a stopped
+// listener has no pod, and re-creating the object would bring it back with the
+// phase unset, which means running.
+//
+// Listeners left behind under a previous name are deleted rather than updated.
+// Every path that could start one looks it up by the name derived now, so a
+// stale-named listener can never run again: updating it would only keep a
+// permanent orphan in step with a spec it will never use. Deleting it also means
+// recovery builds the listener fresh, from the name and spec as they stand then.
+func (r *AutoscalingRunnerSetReconciler) propagateToStoppedListener(
+	ctx context.Context,
+	autoscalingRunnerSet *v1alpha1.AutoscalingRunnerSet,
+	ephemeralRunnerSet *v1alpha1.EphemeralRunnerSet,
+	log logr.Logger,
+) error {
+	listeners, err := r.listenersForAutoscalingRunnerSet(ctx, autoscalingRunnerSet)
+	if err != nil {
+		return err
+	}
+
+	currentName := scaleSetListenerName(autoscalingRunnerSet)
+	var current *v1alpha1.AutoscalingListener
+	renamed := false
+	for i := range listeners {
+		if listeners[i].Name == currentName {
+			current = &listeners[i]
+			continue
+		}
+		renamed = true
+	}
+
+	switch {
+	case current == nil && !renamed:
+		// The scale set has no listener at all, which is not something an edit
+		// caused: a rejected runner spec is never rebuilt into a listener, so
+		// there is nothing here to bring up to date.
+		return nil
+	case current == nil:
+		// The listener the scale set does have answers to a previous name, so an
+		// edit renamed it. Create the replacement stopped rather than waiting
+		// for recovery to do it: a parked scale set is meant to be visible as a
+		// listener that exists and is switched off, and that should not stop
+		// being true because the user edited the runner group.
+		//
+		// The replacement is created before the listener under the previous name
+		// is deleted, which is the opposite order to the running path. Here the
+		// risk being avoided is a parked scale set that momentarily has no
+		// listener at all; overlapping briefly costs nothing, because both
+		// objects are stopped and a stopped listener has no pod. On the running
+		// path the order is reversed for the same reason read the other way:
+		// overlapping there would mean two listeners acquiring jobs at once.
+		if err := r.createStoppedListener(ctx, autoscalingRunnerSet, ephemeralRunnerSet, log); err != nil {
+			return err
+		}
+
+		_, err := r.deleteRenamedListeners(ctx, autoscalingRunnerSet, log)
+		return err
+	}
+
+	listener := *current
+	if !listener.DeletionTimestamp.IsZero() {
+		_, err := r.deleteRenamedListeners(ctx, autoscalingRunnerSet, log)
+		return err
+	}
+
+	desired, err := r.newAutoscalingListener(
+		autoscalingRunnerSet,
+		ephemeralRunnerSet,
+		r.ControllerNamespace,
+		r.DefaultRunnerScaleSetListenerImage,
+		r.listenerImagePullSecrets(),
+	)
+	if err != nil {
+		return err
+	}
+
+	desiredLabels := r.filterAndMergeLabels(listener.Labels, desired.Labels)
+	desiredAnnotations := r.mergeAnnotations(listener.Annotations, desired.Annotations)
+	if !listenerSpecChanged(&listener, desired) &&
+		maps.Equal(listener.Labels, desiredLabels) &&
+		maps.Equal(listener.Annotations, desiredAnnotations) {
+		_, err := r.deleteRenamedListeners(ctx, autoscalingRunnerSet, log)
+		return err
+	}
+
+	log.Info("Updating the stopped listener to match the desired spec")
+	original := listener.DeepCopy()
+	listener.Spec = desired.Spec
+	// The phase is forced rather than carried over from the live object. This
+	// helper only runs on the parked path, immediately after stopListener has
+	// patched the phase, and the read above goes through the cache: it can still
+	// return the pre-patch object. Preserving what it reported would write
+	// Running back onto a listener this same reconcile has just switched off.
+	// The desired listener says nothing about the phase either, since it is
+	// written onto the live object rather than derived from the
+	// AutoscalingRunnerSet.
+	listener.Spec.Phase = v1alpha1.AutoscalingListenerPhaseStopped
+	listener.Labels = desiredLabels
+	listener.Annotations = desiredAnnotations
+	if err := r.Patch(ctx, &listener, client.MergeFrom(original)); err != nil {
+		return err
+	}
+
+	log.Info("Updated the stopped listener")
+
+	_, err = r.deleteRenamedListeners(ctx, autoscalingRunnerSet, log)
+	return err
+}
+
+// createStoppedListener creates the listener a parked scale set should have, in
+// the stopped phase, so it never runs a pod.
+func (r *AutoscalingRunnerSetReconciler) createStoppedListener(
+	ctx context.Context,
+	autoscalingRunnerSet *v1alpha1.AutoscalingRunnerSet,
+	ephemeralRunnerSet *v1alpha1.EphemeralRunnerSet,
+	log logr.Logger,
+) error {
+	desired, err := r.newAutoscalingListener(
+		autoscalingRunnerSet,
+		ephemeralRunnerSet,
+		r.ControllerNamespace,
+		r.DefaultRunnerScaleSetListenerImage,
+		r.listenerImagePullSecrets(),
+	)
+	if err != nil {
+		return err
+	}
+
+	// Copied before the phase is stamped on. newAutoscalingListener serves a
+	// shared pointer out of the resource cache, so mutating what it returns
+	// switches off the desired listener every later caller derives, not just
+	// this one. Create would write the resulting object's identity back into the
+	// same shared entry for the same reason.
+	desired = desired.DeepCopy()
+	desired.Spec.Phase = v1alpha1.AutoscalingListenerPhaseStopped
+	log.Info("Creating the listener of a parked scale set in the stopped phase", "listener", desired.Name)
+	if err := r.Create(ctx, desired); err != nil && !kerrors.IsAlreadyExists(err) {
+		return fmt.Errorf("failed to create the stopped listener: %w", err)
+	}
+
+	return nil
+}
+
+// reconcileOutdated holds a scale set whose runners rejected the runner spec.
+//
+// The listener is stopped so no new jobs are acquired, and the EphemeralRunnerSet
+// is pinned to zero replicas so it releases every runner that is not currently
+// executing a job. Neither object is deleted: the user has not asked for the
+// scale set to go away, and rebuilding it would only publish the same rejected
+// spec again, in a loop. Keeping them also preserves the revision bookkeeping
+// that decides when the scale set may run again.
+//
+// This state is left only when the runner spec the runners rejected is changed,
+// which moves the phase back to pending and lets the next reconcile publish the
+// new spec to the set and start the listener again.
+//
+// Switched off is not frozen, though. Edits that are not a recovery signal are
+// still propagated to both objects while they are parked, so the scale set that
+// eventually recovers is the one the user has been editing rather than the one
+// it was parked as.
+func (r *AutoscalingRunnerSetReconciler) reconcileOutdated(ctx context.Context, autoscalingRunnerSet *v1alpha1.AutoscalingRunnerSet, log logr.Logger) (ctrl.Result, error) {
+	log.Info("Autoscaling runner set is in outdated phase, stopping the listener")
+	if err := r.stopListener(ctx, autoscalingRunnerSet, log); err != nil {
+		log.Error(err, "Failed to stop the listener for the outdated runner set")
+		return ctrl.Result{}, err
+	}
+
+	var ephemeralRunnerSet v1alpha1.EphemeralRunnerSet
+	err := r.Get(
+		ctx,
+		types.NamespacedName{
+			Namespace: autoscalingRunnerSet.Namespace,
+			Name:      autoscalingRunnerSet.Name,
+		},
+		&ephemeralRunnerSet,
+	)
+	switch {
+	case kerrors.IsNotFound(err):
+		// If the ephemeral runner set is not found, something removed the ephemeral runner set. The ephemeral runner set should
+		// not be removed by the controller once it is outdated. However, if the ephemeral runner set is removed, it means no ephemeral
+		// runners should be running (or at least no ephemeral runners associated with the ephemeral runner set).
+		// Therefore, this state is acceptable, because the update to the autoscaling runner set will trigger the loop
+		// that will eventually create a new ephemeral runner set.
+		log.Info("Ephemeral runner set is not found. Ignoring the state until the autoscaling runner set is updated")
+		return ctrl.Result{}, nil
+	case err != nil:
+		log.Error(err, "Failed to get ephemeral runner set for the outdated runner set")
+		return ctrl.Result{}, err
+	default:
+		if !ephemeralRunnerSet.DeletionTimestamp.IsZero() {
+			// Same as NotFound case, ignore.
+			return ctrl.Result{}, nil
+		}
+
+		if err := r.propagateToStoppedListener(ctx, autoscalingRunnerSet, &ephemeralRunnerSet, log); err != nil {
+			log.Error(err, "Failed to update the stopped listener for the outdated runner set")
+			return ctrl.Result{}, err
+		}
+
+		// Labels and annotations are all that can differ here. The runner spec
+		// and the runner metadata are recovery signals, so if either had changed
+		// this reconcile would have taken the recovery path instead of this one,
+		// and publishing them from here would hand the runners a new spec without
+		// the revision bump that tells the set to stop judging itself by the
+		// runners that failed.
+		desired, err := r.newEphemeralRunnerSet(autoscalingRunnerSet)
+		if err != nil {
+			log.Error(err, "Failed to generate ephemeral runner set spec for the outdated runner set")
+			return ctrl.Result{}, err
+		}
+
+		desiredLabels := r.filterAndMergeLabels(ephemeralRunnerSet.Labels, desired.Labels)
+		desiredAnnotations := r.mergeAnnotations(ephemeralRunnerSet.Annotations, desired.Annotations)
+
+		pinned := ephemeralRunnerSet.Spec.Replicas == 0 && ephemeralRunnerSet.Spec.PatchID == 0
+		if pinned &&
+			maps.Equal(ephemeralRunnerSet.Labels, desiredLabels) &&
+			maps.Equal(ephemeralRunnerSet.Annotations, desiredAnnotations) {
+			return ctrl.Result{}, nil
+		}
+
+		original := ephemeralRunnerSet.DeepCopy()
+		ephemeralRunnerSet.Spec.Replicas = 0
+		ephemeralRunnerSet.Spec.PatchID = 0
+		ephemeralRunnerSet.Labels = desiredLabels
+		ephemeralRunnerSet.Annotations = desiredAnnotations
+		if err := r.Patch(ctx, &ephemeralRunnerSet, client.MergeFrom(original)); err != nil {
+			log.Error(err, "Failed to patch ephemeral runner set with 0 replicas and reset patch ID for the outdated runner set")
+			return ctrl.Result{}, err
+		}
+
+		return ctrl.Result{}, nil
+	}
+}
+
+func (r *AutoscalingRunnerSetReconciler) cleanUpResources(ctx context.Context, autoscalingRunnerSet *v1alpha1.AutoscalingRunnerSet, log logr.Logger) (bool, error) {
+	log.Info("Deleting the listener")
+	done, err := r.cleanupListener(ctx, autoscalingRunnerSet, log)
+	if err != nil {
+		log.Error(err, "Failed to clean up listener")
+		return false, err
+	}
+
+	if !done {
+		log.Info("Waiting for listener to be deleted")
+		return false, nil
+	}
+
+	log.Info("deleting ephemeral runner sets")
+	done, err = r.cleanupEphemeralRunnerSet(ctx, autoscalingRunnerSet, log)
+	if err != nil {
+		log.Error(err, "Failed to clean up ephemeral runner sets")
+		return false, err
+	}
+	if !done {
+		log.Info("Waiting for ephemeral runner sets to be deleted")
+		return false, nil
+	}
+
+	log.Info("deleting runner scale set")
+	err = r.deleteRunnerScaleSet(ctx, autoscalingRunnerSet, log)
+	if err != nil {
+		log.Error(err, "Failed to delete runner scale set")
+		return false, err
+	}
+
+	return true, nil
+}
+
+// Update the status of autoscaling runner set if necessary
+func (r *AutoscalingRunnerSetReconciler) updateStatus(
+	ctx context.Context,
+	autoscalingRunnerSet *v1alpha1.AutoscalingRunnerSet,
+	phase v1alpha1.AutoscalingRunnerSetPhase,
+	observedGeneration int64,
+	log logr.Logger,
+) error {
+	phaseDiff := phase != autoscalingRunnerSet.Status.Phase
+	observedGenerationDiff := observedGeneration != autoscalingRunnerSet.Status.ObservedGeneration
+	if !phaseDiff && !observedGenerationDiff {
+		return nil
+	}
+
+	original := autoscalingRunnerSet.DeepCopy()
+	autoscalingRunnerSet.Status.Phase = phase
+	autoscalingRunnerSet.Status.ObservedGeneration = observedGeneration
+
+	if err := r.Status().Patch(ctx, autoscalingRunnerSet, client.MergeFrom(original)); err != nil {
+		log.Error(err, "Failed to patch autoscaling runner set status")
+		return err
+	}
+
+	return nil
+}
+
+// Every listener the scale set owns is waited on, not just the one answering to
+// the name derived from it now. This gates the removal of the scale set's
+// finalizer, and a listener left behind under a previous name still has a pod:
+// reporting it gone would tear the scale set down while it is still acquiring
+// jobs.
+func (r *AutoscalingRunnerSetReconciler) cleanupListener(ctx context.Context, autoscalingRunnerSet *v1alpha1.AutoscalingRunnerSet, logger logr.Logger) (done bool, err error) {
+	logger.Info("Cleaning up the listener")
+	listeners, err := r.listenersForAutoscalingRunnerSet(ctx, autoscalingRunnerSet)
+	if err != nil {
+		return false, err
+	}
+
+	if len(listeners) == 0 {
+		logger.Info("Listener is deleted")
+		return true, nil
+	}
+
+	for i := range listeners {
+		listener := &listeners[i]
+		if !listener.DeletionTimestamp.IsZero() {
+			continue
+		}
+
+		logger.Info("Deleting the listener", "listener", listener.Name)
+		if err := r.Delete(ctx, listener); err != nil && !kerrors.IsNotFound(err) {
+			return false, fmt.Errorf("failed to delete listener %q: %w", listener.Name, err)
+		}
+	}
+
+	return false, nil
+}
+
+func (r *AutoscalingRunnerSetReconciler) cleanupEphemeralRunnerSet(ctx context.Context, autoscalingRunnerSet *v1alpha1.AutoscalingRunnerSet, logger logr.Logger) (done bool, err error) {
+	logger.Info("Cleaning up ephemeral runner set")
+	var ers v1alpha1.EphemeralRunnerSet
+	err = r.Get(
+		ctx,
+		client.ObjectKey{
+			Namespace: autoscalingRunnerSet.Namespace,
+			Name:      autoscalingRunnerSet.Name,
+		},
+		&ers,
+	)
+	switch {
+	case err == nil:
+		if ers.DeletionTimestamp.IsZero() {
+			logger.Info("Deleting the ephemeral runner set")
+			if err := r.Delete(ctx, &ers); err != nil {
+				return false, fmt.Errorf("failed to delete ephemeral runner set: %w", err)
+			}
+		}
+		return false, nil
+	case !kerrors.IsNotFound(err):
+		return false, fmt.Errorf("failed to get ephemeral runner set: %w", err)
+	}
+
+	logger.Info("Ephemeral runner set is deleted")
+	return true, nil
+}
+
+func (r *AutoscalingRunnerSetReconciler) removeFinalizersFromDependentResources(ctx context.Context, autoscalingRunnerSet *v1alpha1.AutoscalingRunnerSet, logger logr.Logger) error {
+	c := autoscalingRunnerSetFinalizerDependencyCleaner{
+		client:               r.Client,
+		autoscalingRunnerSet: autoscalingRunnerSet,
+		logger:               logger,
+	}
+
+	c.removeKubernetesModeRoleBindingFinalizer(ctx)
+	c.removeKubernetesModeRoleFinalizer(ctx)
+	c.removeKubernetesModeServiceAccountFinalizer(ctx)
+	c.removeNoPermissionServiceAccountFinalizer(ctx)
+	c.removeGitHubSecretFinalizer(ctx)
+	c.removeManagerRoleBindingFinalizer(ctx)
+	c.removeManagerRoleFinalizer(ctx)
+
+	return c.Err()
+}
+
+func (r *AutoscalingRunnerSetReconciler) createRunnerScaleSet(ctx context.Context, autoscalingRunnerSet *v1alpha1.AutoscalingRunnerSet, logger logr.Logger) (ctrl.Result, error) {
+	original := autoscalingRunnerSet.DeepCopy()
+	logger.Info("Creating a new runner scale set")
+	actionsClient, err := r.GetActionsService(ctx, autoscalingRunnerSet)
+	if len(autoscalingRunnerSet.Spec.RunnerScaleSetName) == 0 {
+		autoscalingRunnerSet.Spec.RunnerScaleSetName = autoscalingRunnerSet.Name
+	}
+	if err != nil {
+		logger.Error(err, "Failed to initialize Actions service client for creating a new runner scale set", "error", err.Error())
+		return ctrl.Result{}, err
+	}
+
+	runnerGroupID := 1
+	if len(autoscalingRunnerSet.Spec.RunnerGroup) > 0 {
+		runnerGroup, err := actionsClient.GetRunnerGroupByName(ctx, autoscalingRunnerSet.Spec.RunnerGroup)
+		if err != nil {
+			logger.Error(err, "Failed to get runner group by name", "runnerGroup", autoscalingRunnerSet.Spec.RunnerGroup)
+			return ctrl.Result{}, err
+		}
+
+		runnerGroupID = int(runnerGroup.ID)
+	}
+
+	runnerScaleSet, err := actionsClient.GetRunnerScaleSet(ctx, runnerGroupID, autoscalingRunnerSet.Spec.RunnerScaleSetName)
+	if err != nil {
+		logger.Error(err, "Failed to get runner scale set from Actions service",
+			"runnerGroupId",
+			strconv.Itoa(runnerGroupID),
+			"runnerScaleSetName",
+			autoscalingRunnerSet.Spec.RunnerScaleSetName)
+		return ctrl.Result{}, err
+	}
+
+	if runnerScaleSet == nil {
+		labels := []scaleset.Label{
+			{
+				Name: autoscalingRunnerSet.Spec.RunnerScaleSetName,
+				Type: "System",
+			},
+		}
+
+		if labelCount := len(autoscalingRunnerSet.Spec.RunnerScaleSetLabels); labelCount > 0 {
+			unique := make(map[string]bool, labelCount+1)
+			unique[autoscalingRunnerSet.Spec.RunnerScaleSetName] = true
+
+			for _, label := range autoscalingRunnerSet.Spec.RunnerScaleSetLabels {
+				if _, exists := unique[label]; exists {
+					logger.Info("Duplicate label found. Skipping adding duplicate label to runner scale set", "label", label)
+					continue
+				}
+				labels = append(labels, scaleset.Label{
+					Name: label,
+					Type: "System",
+				})
+				unique[label] = true
+			}
+		}
+		runnerScaleSet, err = actionsClient.CreateRunnerScaleSet(
+			ctx,
+			&scaleset.RunnerScaleSet{
+				Name:          autoscalingRunnerSet.Spec.RunnerScaleSetName,
+				RunnerGroupID: runnerGroupID,
+				Labels:        labels,
+				RunnerSetting: scaleset.RunnerSetting{
+					DisableUpdate: true,
+				},
+			},
+		)
+		if err != nil {
+			logger.Error(err, "Failed to create a new runner scale set on Actions service")
+			return ctrl.Result{}, err
+		}
+	}
+
+	info := actionsClient.SystemInfo()
+	info.ScaleSetID = runnerScaleSet.ID
+	actionsClient.SetSystemInfo(info)
+
+	logger.Info("Created/Reused a runner scale set", "id", runnerScaleSet.ID, "runnerGroupName", runnerScaleSet.RunnerGroupName)
+	if autoscalingRunnerSet.Annotations == nil {
+		autoscalingRunnerSet.Annotations = map[string]string{}
+	}
+	if autoscalingRunnerSet.Labels == nil {
+		autoscalingRunnerSet.Labels = map[string]string{}
+	}
+
+	autoscalingRunnerSet.Annotations[AnnotationKeyGitHubRunnerScaleSetName] = runnerScaleSet.Name
+	autoscalingRunnerSet.Annotations[runnerScaleSetIDAnnotationKey] = strconv.Itoa(runnerScaleSet.ID)
+	autoscalingRunnerSet.Annotations[AnnotationKeyGitHubRunnerGroupName] = runnerScaleSet.RunnerGroupName
+	if err := applyGitHubURLLabels(autoscalingRunnerSet.Spec.GitHubConfigUrl, autoscalingRunnerSet.Labels); err != nil { // should never happen
+		logger.Error(err, "Failed to apply GitHub URL labels")
+		return ctrl.Result{}, err
+	}
+
+	logger.Info("Adding runner scale set ID, name and runner group name as an annotation and url labels")
+	if err = r.Patch(ctx, autoscalingRunnerSet, client.MergeFrom(original)); err != nil {
+		logger.Error(err, "Failed to add runner scale set ID, name and runner group name as an annotation")
+		return ctrl.Result{}, err
+	}
+
+	logger.Info("Updated with runner scale set ID, name and runner group name as an annotation",
+		"id", runnerScaleSet.ID,
+		"name", runnerScaleSet.Name,
+		"runnerGroupName", runnerScaleSet.RunnerGroupName)
+	return ctrl.Result{}, nil
+}
+
+func (r *AutoscalingRunnerSetReconciler) updateRunnerScaleSetRunnerGroup(ctx context.Context, autoscalingRunnerSet *v1alpha1.AutoscalingRunnerSet, logger logr.Logger) (ctrl.Result, error) {
+	runnerScaleSetID, err := strconv.Atoi(autoscalingRunnerSet.Annotations[runnerScaleSetIDAnnotationKey])
+	if err != nil {
+		logger.Error(err, "Failed to parse runner scale set ID")
+		return ctrl.Result{}, err
+	}
+
+	actionsClient, err := r.GetActionsService(ctx, autoscalingRunnerSet)
+	if err != nil {
+		logger.Error(err, "Failed to initialize Actions service client for updating a existing runner scale set")
+		return ctrl.Result{}, err
+	}
+
+	runnerGroupID := 1
+	if len(autoscalingRunnerSet.Spec.RunnerGroup) > 0 {
+		runnerGroup, err := actionsClient.GetRunnerGroupByName(ctx, autoscalingRunnerSet.Spec.RunnerGroup)
+		if err != nil {
+			logger.Error(err, "Failed to get runner group by name", "runnerGroup", autoscalingRunnerSet.Spec.RunnerGroup)
+			return ctrl.Result{}, err
+		}
+
+		runnerGroupID = int(runnerGroup.ID)
+	}
+
+	updatedRunnerScaleSet, err := actionsClient.UpdateRunnerScaleSet(ctx, runnerScaleSetID, &scaleset.RunnerScaleSet{RunnerGroupID: runnerGroupID})
+	if err != nil {
+		logger.Error(err, "Failed to update runner scale set", "runnerScaleSetId", runnerScaleSetID)
+		return ctrl.Result{}, err
+	}
+
+	logger.Info("Updating runner scale set name and runner group name as annotations")
+	original := autoscalingRunnerSet.DeepCopy()
+	autoscalingRunnerSet.Annotations[AnnotationKeyGitHubRunnerGroupName] = updatedRunnerScaleSet.RunnerGroupName
+	autoscalingRunnerSet.Annotations[AnnotationKeyGitHubRunnerScaleSetName] = updatedRunnerScaleSet.Name
+	if err := r.Patch(ctx, autoscalingRunnerSet, client.MergeFrom(original)); err != nil {
+		logger.Error(err, "Failed to update runner group name and runner scale set name annotation")
+		return ctrl.Result{}, err
+	}
+
+	logger.Info("Updated runner scale set with match runner group", "runnerGroup", updatedRunnerScaleSet.RunnerGroupName)
+	return ctrl.Result{}, nil
+}
+
+func (r *AutoscalingRunnerSetReconciler) updateRunnerScaleSetName(ctx context.Context, autoscalingRunnerSet *v1alpha1.AutoscalingRunnerSet, logger logr.Logger) (ctrl.Result, error) {
+	runnerScaleSetID, err := strconv.Atoi(autoscalingRunnerSet.Annotations[runnerScaleSetIDAnnotationKey])
+	if err != nil {
+		logger.Error(err, "Failed to parse runner scale set ID")
+		return ctrl.Result{}, err
+	}
+
+	if len(autoscalingRunnerSet.Spec.RunnerScaleSetName) == 0 {
+		logger.Info("Runner scale set name is not specified, skipping")
+		return ctrl.Result{}, nil
+	}
+
+	actionsClient, err := r.GetActionsService(ctx, autoscalingRunnerSet)
+	if err != nil {
+		logger.Error(err, "Failed to initialize Actions service client for updating a existing runner scale set")
+		return ctrl.Result{}, err
+	}
+
+	updatedRunnerScaleSet, err := actionsClient.UpdateRunnerScaleSet(ctx, runnerScaleSetID, &scaleset.RunnerScaleSet{Name: autoscalingRunnerSet.Spec.RunnerScaleSetName})
+	if err != nil {
+		logger.Error(err, "Failed to update runner scale set", "runnerScaleSetId", runnerScaleSetID)
+		return ctrl.Result{}, err
+	}
+
+	logger.Info("Updating runner scale set name as an annotation")
+	original := autoscalingRunnerSet.DeepCopy()
+	autoscalingRunnerSet.Annotations[AnnotationKeyGitHubRunnerScaleSetName] = updatedRunnerScaleSet.Name
+	if err := r.Patch(ctx, autoscalingRunnerSet, client.MergeFrom(original)); err != nil {
+		logger.Error(err, "Failed to update runner scale set name annotation")
+		return ctrl.Result{}, err
+	}
+
+	logger.Info("Updated runner scale set with match name", "name", updatedRunnerScaleSet.Name)
+	return ctrl.Result{}, nil
+}
+
+func (r *AutoscalingRunnerSetReconciler) deleteRunnerScaleSet(ctx context.Context, autoscalingRunnerSet *v1alpha1.AutoscalingRunnerSet, logger logr.Logger) error {
+	scaleSetID, ok := autoscalingRunnerSet.Annotations[runnerScaleSetIDAnnotationKey]
+	if !ok {
+		// Annotation not being present can occur in 3 scenarios
+		// 1. Scale set is never created.
+		//    In this case, we don't need to fetch the actions client to delete the scale set that does not exist
+		//
+		// 2. The scale set has been deleted by the controller.
+		//    In that case, the controller will clean up annotation because the scale set does not exist anymore.
+		//    Removal of the scale set id is also useful because permission cleanup will later lose permission
+		//    assigned to it on a GitHub secret, causing actions client from secret to result in permission denied
+		//
+		// 3. Annotation is removed manually.
+		//    In this case, the controller will treat this as if the scale set is being removed from the actions service
+		//    Then, manual deletion of the scale set is required.
+		return nil
+	}
+	logger.Info("Deleting the runner scale set from Actions service")
+	runnerScaleSetID, err := strconv.Atoi(scaleSetID)
+	if err != nil {
+		// If the annotation is not set correctly, we are going to get stuck in a loop trying to parse the scale set id.
+		// If the configuration is invalid (secret does not exist for example), we never got to the point to create runner set.
+		// But then, manual cleanup would get stuck finalizing the resource trying to parse annotation indefinitely
+		logger.Info("autoscaling runner set does not have annotation describing scale set id. Skip deletion", "err", err.Error())
+		return nil
+	}
+
+	actionsClient, err := r.GetActionsService(ctx, autoscalingRunnerSet)
+	switch {
+	case errors.Is(err, secretresolver.ErrNotFound):
+		// A secret or config map the client is built from is gone, from Kubernetes or the vault. Retrying cannot bring it back,
+		// so release the autoscaling runner set instead of leaving it stuck in Terminating.
+		logger.Error(
+			err,
+			"A secret or config map required to reach the Actions service no longer exists in Kubernetes or the configured vault. The runner scale set cannot be deregistered and must be deleted manually from the Actions service",
+			"runnerScaleSetId", runnerScaleSetID,
+		)
+		return r.removeRunnerScaleSetIDAnnotation(ctx, autoscalingRunnerSet, runnerScaleSetID, logger)
+	case err != nil:
+		logger.Error(err, "Failed to initialize Actions service client for updating a existing runner scale set")
+		return err
+	}
+
+	switch err := actionsClient.DeleteRunnerScaleSet(ctx, runnerScaleSetID); {
+	case errors.Is(err, scaleset.NotFoundError):
+		// Already gone, so the desired state is met. Returning the error instead would leave the
+		// finalizer in place and the autoscaling runner set stuck in Terminating.
+		logger.Info("Runner scale set is already deleted from the Actions service", "runnerScaleSetId", runnerScaleSetID)
+	case err != nil:
+		logger.Error(err, "Failed to delete runner scale set", "runnerScaleSetId", runnerScaleSetID)
+		return err
+	}
+
+	if err := r.removeRunnerScaleSetIDAnnotation(ctx, autoscalingRunnerSet, runnerScaleSetID, logger); err != nil {
+		return err
+	}
+
+	logger.Info("Deleted the runner scale set from Actions service")
+	return nil
+}
+
+func (r *AutoscalingRunnerSetReconciler) removeRunnerScaleSetIDAnnotation(ctx context.Context, autoscalingRunnerSet *v1alpha1.AutoscalingRunnerSet, runnerScaleSetID int, logger logr.Logger) error {
+	original := autoscalingRunnerSet.DeepCopy()
+	delete(autoscalingRunnerSet.Annotations, runnerScaleSetIDAnnotationKey)
+
+	if err := r.Patch(ctx, autoscalingRunnerSet, client.MergeFrom(original)); err != nil {
+		logger.Error(err, "Failed to remove runner scale set ID annotation", "runnerScaleSetId", runnerScaleSetID)
+		return err
+	}
+
+	return nil
+}
+
+func (r *AutoscalingRunnerSetReconciler) createEphemeralRunnerSet(ctx context.Context, autoscalingRunnerSet *v1alpha1.AutoscalingRunnerSet, log logr.Logger) (ctrl.Result, error) {
+	r.ResourceCache.ephemeralRunnerSet.Delete(autoscalingRunnerSet)
+	desiredRunnerSet, err := r.newEphemeralRunnerSet(autoscalingRunnerSet)
+	if err != nil {
+		log.Error(err, "Could not create EphemeralRunnerSet")
+		return ctrl.Result{}, err
+	}
+
+	log.Info("Creating a new EphemeralRunnerSet resource")
+	if err := r.Create(ctx, desiredRunnerSet); err != nil {
+		log.Error(err, "Failed to create EphemeralRunnerSet resource")
+		return ctrl.Result{}, err
+	}
+
+	log.Info("Created a new EphemeralRunnerSet resource", "name", desiredRunnerSet.Name)
+	return ctrl.Result{}, nil
+}
+
+// listenerImagePullSecrets returns the credentials the listener image is pulled
+// with. They come from controller configuration rather than from the
+// AutoscalingRunnerSet, so every caller that derives a desired listener has to
+// supply them: a caller that leaves them out does not describe a listener
+// without credentials, it describes a listener whose credentials it forgot, and
+// anything comparing against it reads the difference as drift.
+func (r *AutoscalingRunnerSetReconciler) listenerImagePullSecrets() []corev1.LocalObjectReference {
+	var imagePullSecrets []corev1.LocalObjectReference
+	for _, imagePullSecret := range r.DefaultRunnerScaleSetListenerImagePullSecrets {
+		imagePullSecrets = append(imagePullSecrets, corev1.LocalObjectReference{
+			Name: imagePullSecret,
+		})
+	}
+
+	return imagePullSecrets
+}
+
+func (r *AutoscalingRunnerSetReconciler) createAutoScalingListenerForRunnerSet(ctx context.Context, autoscalingRunnerSet *v1alpha1.AutoscalingRunnerSet, ephemeralRunnerSet *v1alpha1.EphemeralRunnerSet, log logr.Logger) (ctrl.Result, error) {
+	imagePullSecrets := r.listenerImagePullSecrets()
+
+	r.ResourceCache.autoscalingListener.Delete(autoscalingRunnerSet)
+	autoscalingListener, err := r.newAutoscalingListener(
+		autoscalingRunnerSet,
+		ephemeralRunnerSet,
+		r.ControllerNamespace,
+		r.DefaultRunnerScaleSetListenerImage,
+		imagePullSecrets,
+	)
+	if err != nil {
+		log.Error(err, "Could not create AutoscalingListener spec")
+		return ctrl.Result{}, err
+	}
+
+	log.Info("Creating a new AutoscalingListener resource", "name", autoscalingListener.Name, "namespace", autoscalingListener.Namespace)
+	if err := r.Create(ctx, autoscalingListener); err != nil {
+		log.Error(err, "Failed to create AutoscalingListener resource")
+		return ctrl.Result{}, err
+	}
+
+	log.Info("Created a new AutoscalingListener resource", "name", autoscalingListener.Name, "namespace", autoscalingListener.Namespace)
+	return ctrl.Result{}, nil
+}
+
+// runnerScaleSetGone reports whether the runner scale set recorded on the autoscaling runner set is
+// no longer present on the Actions service. A scale set can disappear out of band: deleted from the
+// organization settings, or dropped and re-registered with a fresh ID. The listener bakes the ID in
+// at startup and crash-loops when it is gone, so this is checked before the listener is created.
+//
+// Only a definitive not-found counts as gone. Any other error is returned so a transient Actions
+// service outage never causes a scale set to be registered a second time.
+func (r *AutoscalingRunnerSetReconciler) runnerScaleSetGone(ctx context.Context, autoscalingRunnerSet *v1alpha1.AutoscalingRunnerSet) (bool, error) {
+	runnerScaleSetID, err := strconv.Atoi(autoscalingRunnerSet.Annotations[runnerScaleSetIDAnnotationKey])
+	if err != nil {
+		return false, fmt.Errorf("failed to parse runner scale set ID: %w", err)
+	}
+
+	actionsClient, err := r.GetActionsService(ctx, autoscalingRunnerSet)
+	if err != nil {
+		return false, fmt.Errorf("failed to initialize Actions service client: %w", err)
+	}
+
+	switch _, err := actionsClient.GetRunnerScaleSetByID(ctx, runnerScaleSetID); {
+	case errors.Is(err, scaleset.NotFoundError):
+		return true, nil
+	case err != nil:
+		return false, fmt.Errorf("failed to get runner scale set %d: %w", runnerScaleSetID, err)
+	default:
+		return false, nil
+	}
+}
+
+// TODO: change that
+func shouldCreateScaleSet(autoscalingRunnerSet *v1alpha1.AutoscalingRunnerSet) bool {
+	scaleSetIDRaw, ok := autoscalingRunnerSet.Annotations[runnerScaleSetIDAnnotationKey]
+	if !ok {
+		return true
+	}
+	id, err := strconv.Atoi(scaleSetIDRaw)
+	return err != nil || id <= 0
+}
+
+// SetupWithManager sets up the controller with the Manager.
+func (r *AutoscalingRunnerSetReconciler) SetupWithManager(mgr ctrl.Manager, opts ...Option) error {
+	r.ResourceBuilder.setSchemeIfUnset(r.Scheme)
+
+	return builderWithOptions(
+		ctrl.NewControllerManagedBy(mgr).
+			For(&v1alpha1.AutoscalingRunnerSet{}).
+			Owns(&v1alpha1.EphemeralRunnerSet{}, builder.WithPredicates(autoscalingRunnerSetOwnedEphemeralRunnerSetPredicate())).
+			Watches(&v1alpha1.AutoscalingListener{}, handler.EnqueueRequestsFromMapFunc(
+				func(_ context.Context, o client.Object) []reconcile.Request {
+					autoscalingListener := o.(*v1alpha1.AutoscalingListener)
+					return []reconcile.Request{
+						{
+							NamespacedName: types.NamespacedName{
+								Namespace: autoscalingListener.Spec.AutoscalingRunnerSetNamespace,
+								Name:      autoscalingListener.Spec.AutoscalingRunnerSetName,
+							},
+						},
+					}
+				},
+			)).
+			WithEventFilter(predicate.ResourceVersionChangedPredicate{}),
+		opts,
+	).Complete(r)
+}
+
+type autoscalingRunnerSetFinalizerDependencyCleaner struct {
+	// configuration fields
+	client               client.Client
+	autoscalingRunnerSet *v1alpha1.AutoscalingRunnerSet
+	logger               logr.Logger
+
+	err error
+}
+
+func (c *autoscalingRunnerSetFinalizerDependencyCleaner) Err() error {
+	return c.err
+}
+
+func (c *autoscalingRunnerSetFinalizerDependencyCleaner) removeKubernetesModeRoleBindingFinalizer(ctx context.Context) {
+	if c.err != nil {
+		c.logger.Info("Skipping cleaning up kubernetes mode service account")
+		return
+	}
+
+	roleBindingName, ok := c.autoscalingRunnerSet.Annotations[AnnotationKeyKubernetesModeRoleBindingName]
+	if !ok {
+		c.logger.Info(
+			"Skipping cleaning up kubernetes mode service account",
+			"reason",
+			fmt.Sprintf("annotation key %q not present", AnnotationKeyKubernetesModeRoleBindingName),
+		)
+		return
+	}
+
+	c.logger.Info("Removing finalizer from container mode kubernetes role binding", "name", roleBindingName)
+
+	roleBinding := new(rbacv1.RoleBinding)
+	err := c.client.Get(ctx, types.NamespacedName{Name: roleBindingName, Namespace: c.autoscalingRunnerSet.Namespace}, roleBinding)
+	switch {
+	case err == nil:
+		if !controllerutil.ContainsFinalizer(roleBinding, AutoscalingRunnerSetCleanupFinalizerName) {
+			c.logger.Info("Kubernetes mode role binding finalizer has already been removed", "name", roleBindingName)
+			return
+		}
+
+		original := roleBinding.DeepCopy()
+		if controllerutil.RemoveFinalizer(roleBinding, AutoscalingRunnerSetCleanupFinalizerName) {
+			if err = c.client.Patch(ctx, roleBinding, client.MergeFrom(original)); err != nil {
+				c.err = fmt.Errorf("failed to patch kubernetes mode role binding without finalizer: %w", err)
+				return
+			}
+		}
+		c.logger.Info("Removed finalizer from container mode kubernetes role binding", "name", roleBindingName)
+		return
+	case !kerrors.IsNotFound(err):
+		c.err = fmt.Errorf("failed to fetch kubernetes mode role binding: %w", err)
+		return
+	default:
+		c.logger.Info("Container mode kubernetes role binding has already been deleted", "name", roleBindingName)
+		return
+	}
+}
+
+func (c *autoscalingRunnerSetFinalizerDependencyCleaner) removeKubernetesModeRoleFinalizer(ctx context.Context) {
+	if c.err != nil {
+		return
+	}
+
+	roleName, ok := c.autoscalingRunnerSet.Annotations[AnnotationKeyKubernetesModeRoleName]
+	if !ok {
+		c.logger.Info(
+			"Skipping cleaning up kubernetes mode role",
+			"reason",
+			fmt.Sprintf("annotation key %q not present", AnnotationKeyKubernetesModeRoleName),
+		)
+		return
+	}
+
+	c.logger.Info("Removing finalizer from container mode kubernetes role", "name", roleName)
+	role := new(rbacv1.Role)
+	err := c.client.Get(ctx, types.NamespacedName{Name: roleName, Namespace: c.autoscalingRunnerSet.Namespace}, role)
+	switch {
+	case err == nil:
+		if !controllerutil.ContainsFinalizer(role, AutoscalingRunnerSetCleanupFinalizerName) {
+			c.logger.Info("Kubernetes mode role finalizer has already been removed", "name", roleName)
+			return
+		}
+		original := role.DeepCopy()
+		if controllerutil.RemoveFinalizer(role, AutoscalingRunnerSetCleanupFinalizerName) {
+			if err = c.client.Patch(ctx, role, client.MergeFrom(original)); err != nil {
+				c.err = fmt.Errorf("failed to patch kubernetes mode role without finalizer: %w", err)
+				return
+			}
+		}
+		c.logger.Info("Removed finalizer from container mode kubernetes role")
+		return
+	case kerrors.IsNotFound(err):
+		c.logger.Info("Container mode kubernetes role has already been deleted", "name", roleName)
+		return
+	default:
+		c.err = fmt.Errorf("failed to fetch kubernetes mode role: %w", err)
+		return
+	}
+}
+
+func (c *autoscalingRunnerSetFinalizerDependencyCleaner) removeKubernetesModeServiceAccountFinalizer(ctx context.Context) {
+	if c.err != nil {
+		return
+	}
+
+	serviceAccountName, ok := c.autoscalingRunnerSet.Annotations[AnnotationKeyKubernetesModeServiceAccountName]
+	if !ok {
+		c.logger.Info(
+			"Skipping cleaning up kubernetes mode role binding",
+			"reason",
+			fmt.Sprintf("annotation key %q not present", AnnotationKeyKubernetesModeServiceAccountName),
+		)
+		return
+	}
+
+	c.logger.Info("Removing finalizer from container mode kubernetes service account", "name", serviceAccountName)
+
+	serviceAccount := new(corev1.ServiceAccount)
+	err := c.client.Get(ctx, types.NamespacedName{Name: serviceAccountName, Namespace: c.autoscalingRunnerSet.Namespace}, serviceAccount)
+	switch {
+	case err == nil:
+		if !controllerutil.ContainsFinalizer(serviceAccount, AutoscalingRunnerSetCleanupFinalizerName) {
+			c.logger.Info("Kubernetes mode service account finalizer has already been removed", "name", serviceAccountName)
+			return
+		}
+		original := serviceAccount.DeepCopy()
+		if controllerutil.RemoveFinalizer(serviceAccount, AutoscalingRunnerSetCleanupFinalizerName) {
+			if err = c.client.Patch(ctx, serviceAccount, client.MergeFrom(original)); err != nil {
+				c.err = fmt.Errorf("failed to patch kubernetes mode service account without finalizer: %w", err)
+				return
+			}
+		}
+
+		c.logger.Info("Removed finalizer from container mode kubernetes service account")
+		return
+	case kerrors.IsNotFound(err):
+		c.logger.Info("Container mode kubernetes service account has already been deleted", "name", serviceAccountName)
+		return
+	default:
+		c.err = fmt.Errorf("failed to fetch kubernetes mode service account: %w", err)
+		return
+	}
+}
+
+func (c *autoscalingRunnerSetFinalizerDependencyCleaner) removeNoPermissionServiceAccountFinalizer(ctx context.Context) {
+	if c.err != nil {
+		return
+	}
+
+	serviceAccountName, ok := c.autoscalingRunnerSet.Annotations[AnnotationKeyNoPermissionServiceAccountName]
+	if !ok {
+		c.logger.Info(
+			"Skipping cleaning up no permission service account",
+			"reason",
+			fmt.Sprintf("annotation key %q not present", AnnotationKeyNoPermissionServiceAccountName),
+		)
+		return
+	}
+
+	c.logger.Info("Removing finalizer from no permission service account", "name", serviceAccountName)
+
+	serviceAccount := new(corev1.ServiceAccount)
+	err := c.client.Get(
+		ctx,
+		types.NamespacedName{
+			Name:      serviceAccountName,
+			Namespace: c.autoscalingRunnerSet.Namespace,
+		},
+		serviceAccount,
+	)
+	switch {
+	case err == nil:
+		if !controllerutil.ContainsFinalizer(serviceAccount, AutoscalingRunnerSetCleanupFinalizerName) {
+			c.logger.Info("No permission service account finalizer has already been removed", "name", serviceAccountName)
+			return
+		}
+		original := serviceAccount.DeepCopy()
+
+		if controllerutil.RemoveFinalizer(serviceAccount, AutoscalingRunnerSetCleanupFinalizerName) {
+			if err = c.client.Patch(ctx, serviceAccount, client.MergeFrom(original)); err != nil {
+				c.err = fmt.Errorf("failed to patch no permission service account without finalizer: %w", err)
+				return
+			}
+		}
+
+		c.logger.Info("Removed finalizer from no permission service account", "name", serviceAccountName)
+		return
+	case kerrors.IsNotFound(err):
+		c.logger.Info("No permission service account has already been deleted", "name", serviceAccountName)
+		return
+	default:
+		c.err = fmt.Errorf("failed to fetch service account: %w", err)
+		return
+	}
+}
+
+func (c *autoscalingRunnerSetFinalizerDependencyCleaner) removeGitHubSecretFinalizer(ctx context.Context) {
+	if c.err != nil {
+		return
+	}
+
+	githubSecretName, ok := c.autoscalingRunnerSet.Annotations[AnnotationKeyGitHubSecretName]
+	if !ok {
+		c.logger.Info(
+			"Skipping cleaning up no permission service account",
+			"reason",
+			fmt.Sprintf("annotation key %q not present", AnnotationKeyGitHubSecretName),
+		)
+		return
+	}
+
+	c.logger.Info("Removing finalizer from GitHub secret", "name", githubSecretName)
+
+	githubSecret := new(corev1.Secret)
+	err := c.client.Get(ctx, types.NamespacedName{Name: githubSecretName, Namespace: c.autoscalingRunnerSet.Namespace}, githubSecret)
+	switch {
+	case err == nil:
+		if !controllerutil.ContainsFinalizer(githubSecret, AutoscalingRunnerSetCleanupFinalizerName) {
+			c.logger.Info("GitHub secret finalizer has already been removed", "name", githubSecretName)
+			return
+		}
+		original := githubSecret.DeepCopy()
+
+		if controllerutil.RemoveFinalizer(githubSecret, AutoscalingRunnerSetCleanupFinalizerName) {
+			if err = c.client.Patch(ctx, githubSecret, client.MergeFrom(original)); err != nil {
+				c.err = fmt.Errorf("failed to patch GitHub secret without finalizer: %w", err)
+				return
+			}
+		}
+		c.logger.Info("Removed finalizer from GitHub secret", "name", githubSecretName)
+		return
+	case kerrors.IsNotFound(err) || kerrors.IsForbidden(err):
+		c.logger.Info("GitHub secret has already been deleted", "name", githubSecretName)
+		return
+	default:
+		c.err = fmt.Errorf("failed to fetch GitHub secret: %w", err)
+		return
+	}
+}
+
+func (c *autoscalingRunnerSetFinalizerDependencyCleaner) removeManagerRoleBindingFinalizer(ctx context.Context) {
+	if c.err != nil {
+		return
+	}
+
+	managerRoleBindingName, ok := c.autoscalingRunnerSet.Annotations[AnnotationKeyManagerRoleBindingName]
+	if !ok {
+		c.logger.Info(
+			"Skipping cleaning up manager role binding",
+			"reason",
+			fmt.Sprintf("annotation key %q not present", AnnotationKeyManagerRoleBindingName),
+		)
+		return
+	}
+
+	c.logger.Info("Removing finalizer from manager role binding", "name", managerRoleBindingName)
+
+	roleBinding := new(rbacv1.RoleBinding)
+	err := c.client.Get(ctx, types.NamespacedName{Name: managerRoleBindingName, Namespace: c.autoscalingRunnerSet.Namespace}, roleBinding)
+	switch {
+	case err == nil:
+		original := roleBinding.DeepCopy()
+		if controllerutil.RemoveFinalizer(roleBinding, AutoscalingRunnerSetCleanupFinalizerName) {
+			if err = c.client.Patch(ctx, roleBinding, client.MergeFrom(original)); err != nil {
+				c.err = fmt.Errorf("failed to patch manager role binding without finalizer: %w", err)
+				return
+			}
+		}
+
+		c.logger.Info("Removed finalizer from manager role binding", "name", managerRoleBindingName)
+		return
+	case kerrors.IsNotFound(err):
+		c.logger.Info("Manager role binding has already been deleted", "name", managerRoleBindingName)
+		return
+	default:
+		c.err = fmt.Errorf("failed to fetch manager role binding: %w", err)
+		return
+	}
+}
+
+func (c *autoscalingRunnerSetFinalizerDependencyCleaner) removeManagerRoleFinalizer(ctx context.Context) {
+	if c.err != nil {
+		return
+	}
+
+	managerRoleName, ok := c.autoscalingRunnerSet.Annotations[AnnotationKeyManagerRoleName]
+	if !ok {
+		c.logger.Info(
+			"Skipping cleaning up manager role",
+			"reason",
+			fmt.Sprintf("annotation key %q not present", AnnotationKeyManagerRoleName),
+		)
+		return
+	}
+
+	c.logger.Info("Removing finalizer from manager role", "name", managerRoleName)
+
+	role := new(rbacv1.Role)
+	err := c.client.Get(ctx, types.NamespacedName{Name: managerRoleName, Namespace: c.autoscalingRunnerSet.Namespace}, role)
+	switch {
+	case err == nil:
+		original := role.DeepCopy()
+		if controllerutil.RemoveFinalizer(role, AutoscalingRunnerSetCleanupFinalizerName) {
+			if err := c.client.Patch(ctx, role, client.MergeFrom(original)); err != nil {
+				c.err = fmt.Errorf("failed to patch manager role without finalizer: %w", err)
+				return
+			}
+		}
+		c.logger.Info("Removed finalizer from manager role", "name", managerRoleName)
+		return
+	case kerrors.IsNotFound(err):
+		c.logger.Info("Manager role has already been deleted", "name", managerRoleName)
+		return
+	default:
+		c.err = fmt.Errorf("failed to fetch manager role: %w", err)
+		return
+	}
+}
